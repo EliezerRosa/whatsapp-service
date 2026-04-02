@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const cors = require('cors');
 const { makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const { createClient } = require('@supabase/supabase-js');
@@ -23,7 +23,7 @@ const supabase = SUPABASE_URL && SUPABASE_KEY
 
 // --- Auth middleware ---
 function requireAuth(req, res, next) {
-  if (!API_KEY) return next(); // no key configured = open (dev mode)
+  if (!API_KEY) return next();
   const token = req.headers['x-api-key'] || req.query.key;
   if (token !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
   next();
@@ -32,23 +32,29 @@ function requireAuth(req, res, next) {
 // --- State ---
 let sock = null;
 let qrCode = null;
-let connectionStatus = 'disconnected'; // disconnected | connecting | qr | connected
+let connectionStatus = 'disconnected';
+let connectedUser = null; // { name, phone, userId }
 
 // --- Supabase auth persistence ---
 async function saveAuthToSupabase() {
   if (!supabase) return;
   try {
-    const files = ['creds.json'];
     const authDir = AUTH_DIR;
     if (!fs.existsSync(authDir)) return;
-
-    // Also save app-state-sync files
     const allFiles = fs.readdirSync(authDir);
     for (const file of allFiles) {
       const content = fs.readFileSync(path.join(authDir, file), 'utf-8');
       await supabase.from('whatsapp_auth').upsert({
         key: file,
         value: content,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'key' });
+    }
+    // Also persist connected user info
+    if (connectedUser) {
+      await supabase.from('whatsapp_auth').upsert({
+        key: '_connected_user',
+        value: JSON.stringify(connectedUser),
         updated_at: new Date().toISOString(),
       }, { onConflict: 'key' });
     }
@@ -68,6 +74,10 @@ async function loadAuthFromSupabase() {
     }
     if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
     for (const row of data) {
+      if (row.key === '_connected_user') {
+        try { connectedUser = JSON.parse(row.value); } catch {}
+        continue;
+      }
       fs.writeFileSync(path.join(AUTH_DIR, row.key), row.value, 'utf-8');
     }
     console.log(`[auth] Restored ${data.length} auth files from Supabase`);
@@ -96,7 +106,7 @@ async function connectWhatsApp() {
     auth: state,
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
-    browser: ['Gestão Reforma', 'Chrome', '22.0'],
+    browser: ['Gestao Reforma', 'Chrome', '22.0'],
     connectTimeoutMs: 60000,
     retryRequestDelayMs: 2000,
   });
@@ -128,9 +138,9 @@ async function connectWhatsApp() {
       console.log(`[wa] Disconnected (code: ${statusCode}), reconnect: ${shouldReconnect}`);
 
       if (statusCode === DisconnectReason.loggedOut) {
-        // Clear auth state
         connectionStatus = 'disconnected';
         qrCode = null;
+        connectedUser = null;
         if (fs.existsSync(AUTH_DIR)) {
           fs.rmSync(AUTH_DIR, { recursive: true, force: true });
         }
@@ -155,13 +165,17 @@ app.get('/status', requireAuth, (req, res) => {
     status: connectionStatus,
     configured: true,
     qr: qrCode,
+    connectedUser: connectionStatus === 'connected' ? connectedUser : null,
   });
 });
 
 app.post('/connect', requireAuth, async (req, res) => {
+  const { userName, userPhone, userId } = req.body || {};
   if (connectionStatus === 'connected') {
-    return res.json({ success: true, message: 'Already connected' });
+    return res.json({ success: true, message: 'Already connected', connectedUser });
   }
+  // Store who is connecting
+  connectedUser = { name: userName || 'Unknown', phone: userPhone || '', userId: userId || '' };
   connectWhatsApp();
   res.json({ success: true, message: 'Connecting...' });
 });
@@ -174,7 +188,7 @@ app.post('/disconnect', requireAuth, async (req, res) => {
   }
   connectionStatus = 'disconnected';
   qrCode = null;
-  // Clear auth
+  connectedUser = null;
   if (fs.existsSync(AUTH_DIR)) {
     fs.rmSync(AUTH_DIR, { recursive: true, force: true });
   }
@@ -254,7 +268,6 @@ function formatJid(phone) {
 // --- Start ---
 app.listen(PORT, () => {
   console.log(`[server] WhatsApp service running on port ${PORT}`);
-  // Auto-connect if auth state exists
   if (supabase) {
     loadAuthFromSupabase().then(() => {
       if (fs.existsSync(path.join(AUTH_DIR, 'creds.json'))) {
